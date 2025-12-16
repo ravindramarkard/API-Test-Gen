@@ -501,6 +501,36 @@ const TestSuite: React.FC = () => {
   const getEndpointDomId = (endpointKey: string) =>
     `endpoint-${endpointKey.replace(/[^a-zA-Z0-9]/g, '-')}`;
 
+  const getCiBadge = () => {
+    const status = (testSuite as any).last_ci_status as string | undefined;
+    const provider = (testSuite as any).last_ci_provider as string | undefined;
+    const url = (testSuite as any).last_ci_url as string | undefined;
+    if (!status) return null;
+    let color: 'default' | 'success' | 'error' | 'info' | 'warning' = 'default';
+    let label = `CI: ${status}`;
+    if (status === 'success') {
+      color = 'success';
+      label = 'CI: Success';
+    } else if (status === 'failed') {
+      color = 'error';
+      label = 'CI: Failed';
+    } else if (status === 'running') {
+      color = 'info';
+      label = 'CI: Running';
+    }
+    const chip = (
+      <Chip
+        label={provider ? `${label} (${provider})` : label}
+        color={color}
+        variant="outlined"
+        size="small"
+        clickable={!!url}
+        onClick={url ? () => window.open(url, '_blank', 'noopener,noreferrer') : undefined}
+      />
+    );
+    return chip;
+  };
+
   // Normalize tests and filtered list (must be before early returns to satisfy hook order)
   const allTests = useMemo(
     () => testSuite?.all_tests || testSuite?.all_test_cases || [],
@@ -597,6 +627,7 @@ const TestSuite: React.FC = () => {
           >
             View Reports
           </Button>
+          {getCiBadge()}
           <Button
             variant="contained"
             startIcon={<PlayArrow />}

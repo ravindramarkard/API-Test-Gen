@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     # LLM Defaults
     DEFAULT_LLM_PROVIDER: str = "openai"
     DEFAULT_LLM_MODEL: str = "gpt-4"
+    LLM_API_KEY: str = ""  # LLM API key from environment variable
     
     # Redis (for Celery)
     REDIS_URL: str = "redis://localhost:6379/0"

@@ -43,6 +43,9 @@ def encrypt_data(data: str) -> str:
 
 def decrypt_data(encrypted_data: str) -> str:
     """Decrypt sensitive data."""
+    if not encrypted_data:
+        raise ValueError("No encrypted data provided")
+    
     try:
         f = get_fernet()
         return f.decrypt(encrypted_data.encode()).decode()
@@ -50,8 +53,23 @@ def decrypt_data(encrypted_data: str) -> str:
         # Log the error for debugging
         import logging
         logger = logging.getLogger(__name__)
-        logger.error(f"Decryption failed: {str(e)}")
-        raise ValueError(f"Failed to decrypt data: {str(e)}")
+        error_type = type(e).__name__
+        error_msg = str(e)
+        logger.error(f"Decryption failed: {error_type} - {error_msg}")
+        
+        # Provide more specific error messages
+        if "InvalidToken" in error_type or "InvalidToken" in error_msg:
+            raise ValueError(
+                "Encrypted data is invalid or corrupted. This usually happens when the encryption key has changed. "
+                "Please re-enter your API key."
+            )
+        elif "InvalidSignature" in error_type or "InvalidSignature" in error_msg:
+            raise ValueError(
+                "Encrypted data signature is invalid. The encryption key may have changed. "
+                "Please re-enter your API key."
+            )
+        else:
+            raise ValueError(f"Failed to decrypt data: {error_msg}. The encryption key may have changed. Please re-enter your API key.")
 
 
 def hash_password(password: str) -> str:

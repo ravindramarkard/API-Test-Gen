@@ -58,6 +58,17 @@ const Config: React.FC = () => {
     llm_endpoint: '',
     llm_model: 'gpt-4',
   });
+  
+  const [llmKeyMasked, setLlmKeyMasked] = useState(true); // Track if showing masked value
+  const [llmKeyPlaceholder, setLlmKeyPlaceholder] = useState(''); // Placeholder for masked key
+
+  const [integrationProvider, setIntegrationProvider] = useState<'jira' | 'github'>('jira');
+  const [integrationBaseUrl, setIntegrationBaseUrl] = useState('');
+  const [integrationProjectKey, setIntegrationProjectKey] = useState('');
+  const [integrationRepoOwner, setIntegrationRepoOwner] = useState('');
+  const [integrationRepoName, setIntegrationRepoName] = useState('');
+  const [integrationToken, setIntegrationToken] = useState('');
+  const [hasExistingIntegrationToken, setHasExistingIntegrationToken] = useState(false);
 
   useEffect(() => {
     if (projectId) {
@@ -85,8 +96,68 @@ const Config: React.FC = () => {
         llm_model: config.llm_model || 'gpt-4',
         llm_endpoint: config.llm_endpoint || '',
       }));
+      
+      // Set masked placeholder if key exists
+      if (config.has_llm_key) {
+        // Generate masked placeholder based on provider
+        const currentProvider = formData.llm_provider || config.llm_provider || 'openai';
+        const maskedValue = currentProvider === 'openai' || currentProvider === 'openrouter' 
+          ? 'sk-••••••••••••••••••••••••••••••••••••' 
+          : '••••••••••••••••••••••••••••••••••••';
+        setLlmKeyPlaceholder(maskedValue);
+        // Keep field empty but show placeholder when masked
+        if (llmKeyMasked) {
+          setFormData((prev) => ({ ...prev, llm_api_key: '' }));
+        }
+      } else {
+        setLlmKeyPlaceholder('');
+        setLlmKeyMasked(true);
+      }
     }
-  }, [config]);
+  }, [config, llmKeyMasked, formData.llm_provider]);
+
+  // Load existing integration configuration for this project (non-sensitive)
+  useEffect(() => {
+    const loadIntegrations = async () => {
+      if (!projectId) return;
+      try {
+        const res = await api.get(`/integrations/config/${projectId}`);
+        const items = res.data as Array<{
+          provider: string;
+          base_url?: string;
+          project_key?: string;
+          repo_owner?: string;
+          repo_name?: string;
+          has_token: boolean;
+        }>;
+        if (items && items.length > 0) {
+          const jira = items.find((i) => i.provider === 'jira');
+          const gh = items.find((i) => i.provider === 'github');
+          const initial = jira || gh || items[0];
+          if (initial) {
+            const prov = (initial.provider as 'jira' | 'github') || 'jira';
+            setIntegrationProvider(prov);
+            setIntegrationBaseUrl(initial.base_url || '');
+            setIntegrationProjectKey(initial.project_key || '');
+            setIntegrationRepoOwner(initial.repo_owner || '');
+            setIntegrationRepoName(initial.repo_name || '');
+            setHasExistingIntegrationToken(initial.has_token);
+            setIntegrationToken('');
+          }
+        } else {
+          setHasExistingIntegrationToken(false);
+          setIntegrationToken('');
+          setIntegrationBaseUrl('');
+          setIntegrationProjectKey('');
+          setIntegrationRepoOwner('');
+          setIntegrationRepoName('');
+        }
+      } catch (err) {
+        console.error('Failed to load integration config', err);
+      }
+    };
+    loadIntegrations();
+  }, [projectId]);
 
   const handleLoadConfigTemplate = (configId: string) => {
     setSelectedConfigId(configId);
@@ -125,7 +196,14 @@ const Config: React.FC = () => {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (projectId) {
-      await dispatch(saveConfig({ projectId, config: formData }));
+      // If field is empty and key exists, don't send llm_api_key (keep existing)
+      const configToSave = { ...formData };
+      if (!formData.llm_api_key && config?.has_llm_key) {
+        // Don't include llm_api_key in the save request - backend will keep existing
+        delete (configToSave as any).llm_api_key;
+      }
+      
+      await dispatch(saveConfig({ projectId, config: configToSave }));
       navigate(`/projects/${projectId}`);
     }
   };
@@ -329,6 +407,139 @@ const Config: React.FC = () => {
             <Divider sx={{ my: 4 }} />
 
             <Typography variant="h6" gutterBottom>
+              Integrations (Jira / GitHub Issues)
+            </Typography>
+            <Alert severity="info" sx={{ mb: 2 }}>
+              Configure an issue tracker to create Jira/GitHub issues directly from failed tests.
+            </Alert>
+            <Grid container spacing={3}>
+              <Grid item xs={12} sm={6}>
+                <FormControl fullWidth>
+                  <InputLabel>Provider</InputLabel>
+                  <Select
+                    label="Provider"
+                    value={integrationProvider}
+                    onChange={(e) =>
+                      setIntegrationProvider(e.target.value as 'jira' | 'github')
+                    }
+                  >
+                    <MenuItem value="jira">Jira</MenuItem>
+                    <MenuItem value="github">GitHub</MenuItem>
+                  </Select>
+                </FormControl>
+              </Grid>
+              <Grid item xs={12} sm={6}>
+                <TextField
+                  fullWidth
+                  label="Base URL"
+                  value={integrationBaseUrl}
+                  onChange={(e) => setIntegrationBaseUrl(e.target.value)}
+                  placeholder={
+                    integrationProvider === 'jira'
+                      ? 'https://your-domain.atlassian.net'
+                      : 'https://api.github.com'
+                  }
+                  helperText={
+                    integrationProvider === 'jira'
+                      ? 'Your Jira cloud or server base URL'
+                      : 'GitHub API base URL (usually https://api.github.com)'
+                  }
+                />
+              </Grid>
+              {integrationProvider === 'jira' ? (
+                <Grid item xs={12} sm={6}>
+                  <TextField
+                    fullWidth
+                    label="Jira Project Key"
+                    value={integrationProjectKey}
+                    onChange={(e) => setIntegrationProjectKey(e.target.value)}
+                    placeholder="ABC"
+                    helperText="Key of the Jira project where bugs will be created"
+                  />
+                </Grid>
+              ) : (
+                <>
+                  <Grid item xs={12} sm={6}>
+                    <TextField
+                      fullWidth
+                      label="GitHub Repo Owner"
+                      value={integrationRepoOwner}
+                      onChange={(e) => setIntegrationRepoOwner(e.target.value)}
+                      placeholder="your-org-or-user"
+                    />
+                  </Grid>
+                  <Grid item xs={12} sm={6}>
+                    <TextField
+                      fullWidth
+                      label="GitHub Repo Name"
+                      value={integrationRepoName}
+                      onChange={(e) => setIntegrationRepoName(e.target.value)}
+                      placeholder="your-repo"
+                    />
+                  </Grid>
+                </>
+              )}
+              <Grid item xs={12}>
+                <TextField
+                  fullWidth
+                  label={
+                    integrationProvider === 'jira'
+                      ? 'Jira API Token / PAT'
+                      : 'GitHub Personal Access Token'
+                  }
+                  type="password"
+                  value={integrationToken}
+                  onChange={(e) => setIntegrationToken(e.target.value)}
+                  helperText={
+                    hasExistingIntegrationToken
+                      ? 'Token already stored. Leave empty to keep existing, or enter a new token to replace.'
+                      : integrationProvider === 'jira'
+                      ? 'API token for a Jira user with permission to create issues.'
+                      : 'GitHub PAT with repo:issues permission.'
+                  }
+                />
+              </Grid>
+              <Grid item xs={12}>
+                <Button
+                  variant="outlined"
+                  onClick={async () => {
+                    if (!projectId) return;
+                    try {
+                      const payload: any = {
+                        provider: integrationProvider,
+                        base_url: integrationBaseUrl || undefined,
+                      };
+                      if (integrationProvider === 'jira') {
+                        payload.project_key = integrationProjectKey || undefined;
+                      } else {
+                        payload.repo_owner = integrationRepoOwner || undefined;
+                        payload.repo_name = integrationRepoName || undefined;
+                      }
+                      if (integrationToken) {
+                        payload.auth_token = integrationToken;
+                      }
+                      await api.post(`/integrations/config/${projectId}`, payload);
+                      alert('✅ Integration configuration saved');
+                      setIntegrationToken('');
+                      setHasExistingIntegrationToken(true);
+                    } catch (error: any) {
+                      const msg =
+                        error.response?.data?.detail ||
+                        error.response?.data?.message ||
+                        error.message ||
+                        'Unknown error';
+                      alert(`❌ Failed to save integration config:\n\n${msg}`);
+                    }
+                  }}
+                >
+                  Save Integration
+                </Button>
+              </Grid>
+            </Grid>
+
+            <Divider sx={{ my: 4 }} />
+
+            <Typography variant="h6" gutterBottom>
               LLM Configuration (for AI-enhanced test generation)
             </Typography>
             <Grid container spacing={3}>
@@ -376,19 +587,49 @@ const Config: React.FC = () => {
                 <TextField
                   fullWidth
                   label="LLM API Key"
-                  type="password"
-                  value={formData.llm_api_key}
-                  onChange={handleChange('llm_api_key')}
+                  type={llmKeyMasked && config?.has_llm_key ? "text" : "password"}
+                  value={llmKeyMasked && config?.has_llm_key ? llmKeyPlaceholder : formData.llm_api_key}
+                  onChange={(e) => {
+                    // If user starts typing, switch to password mode and clear placeholder
+                    if (llmKeyMasked && config?.has_llm_key) {
+                      setLlmKeyMasked(false);
+                      setFormData((prev) => ({ ...prev, llm_api_key: e.target.value }));
+                    } else {
+                      handleChange('llm_api_key')(e);
+                    }
+                  }}
+                  onFocus={() => {
+                    // When focused, if showing masked value, switch to edit mode
+                    if (llmKeyMasked && config?.has_llm_key) {
+                      setLlmKeyMasked(false);
+                      setFormData((prev) => ({ ...prev, llm_api_key: '' }));
+                    }
+                  }}
+                  onBlur={() => {
+                    // If field is empty after blur and key exists, show masked again
+                    if (!formData.llm_api_key && config?.has_llm_key) {
+                      setLlmKeyMasked(true);
+                    }
+                  }}
                   helperText={
                     formData.llm_provider === 'local'
                       ? "Not required for local Ollama (leave empty)"
                       : config?.has_llm_key
-                        ? "Key on file. Leave empty to keep existing, enter to replace."
+                        ? llmKeyMasked
+                          ? "Key stored (encrypted). Click to edit or leave empty to keep existing."
+                          : "Key on file. Leave empty to keep existing, enter to replace."
                         : formData.llm_provider === 'openrouter'
                           ? "Your OpenRouter API key (get from https://openrouter.ai)"
                           : "Your API key for the selected LLM provider"
                   }
                   disabled={formData.llm_provider === 'local'}
+                  InputProps={{
+                    readOnly: llmKeyMasked && config?.has_llm_key,
+                    style: llmKeyMasked && config?.has_llm_key ? { 
+                      fontFamily: 'monospace',
+                      color: '#666'
+                    } : {}
+                  }}
                 />
               </Grid>
 
@@ -467,16 +708,51 @@ const Config: React.FC = () => {
                 onClick={async () => {
                   // Test LLM connection
                   try {
-                    const response = await api.post(`/config/${projectId}/test-llm`, {
-                      llm_provider: formData.llm_provider,
-                      llm_api_key: formData.llm_api_key || undefined,
-                      llm_endpoint: formData.llm_endpoint || undefined,
+                    // If field is empty or showing masked value, don't send key (backend will use stored one)
+                    // Only send the key if user explicitly entered a new one
+                    const apiKeyToSend = (llmKeyMasked && config?.has_llm_key) || !formData.llm_api_key || formData.llm_api_key.trim() === ''
+                      ? undefined 
+                      : formData.llm_api_key;
+                    
+                    // Build request payload - only include fields that have values
+                    const testPayload: any = {
+                      llm_provider: formData.llm_provider || 'openai',
                       llm_model: formData.llm_model || 'gpt-4',
-                    });
+                    };
+                    
+                    // Only include API key if user provided a new one
+                    if (apiKeyToSend) {
+                      testPayload.llm_api_key = apiKeyToSend;
+                    }
+                    
+                    // Only include endpoint if provided
+                    if (formData.llm_endpoint && formData.llm_endpoint.trim()) {
+                      testPayload.llm_endpoint = formData.llm_endpoint;
+                    }
+                    
+                    const response = await api.post(`/config/${projectId}/test-llm`, testPayload);
                     alert(`✅ LLM Connection Successful!\n\n${response.data.message || 'LLM connection is working.'}\n\nProvider: ${response.data.provider}\nEndpoint: ${response.data.endpoint}`);
                   } catch (error: any) {
                     const errorMsg = error.response?.data?.detail || error.response?.data?.message || error.message || 'Unknown error';
-                    alert(`❌ LLM Connection Failed:\n\n${errorMsg}`);
+                    
+                    // If decryption failed, prompt user to re-enter the key
+                    if (errorMsg.includes('decrypt') || errorMsg.includes('decryption')) {
+                      const shouldReenter = window.confirm(
+                        `❌ LLM Connection Failed:\n\n${errorMsg}\n\nWould you like to re-enter your LLM API key?`
+                      );
+                      if (shouldReenter) {
+                        // Unmask the field so user can enter new key
+                        setLlmKeyMasked(false);
+                        setFormData((prev) => ({ ...prev, llm_api_key: '' }));
+                        // Focus on the LLM API key field
+                        setTimeout(() => {
+                          const keyField = document.querySelector('input[type="password"][label*="LLM API Key"]') as HTMLInputElement;
+                          if (keyField) keyField.focus();
+                        }, 100);
+                      }
+                    } else {
+                      alert(`❌ LLM Connection Failed:\n\n${errorMsg}`);
+                    }
                   }
                 }}
                 disabled={loading || !formData.llm_provider}

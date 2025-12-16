@@ -8,8 +8,9 @@ RUN apt-get update && apt-get install -y \
     postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Poetry
-RUN pip install poetry
+# Install Poetry (latest version to avoid packaging.licenses issue)
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install poetry==1.7.1
 
 # Copy dependency files
 COPY pyproject.toml poetry.lock* ./

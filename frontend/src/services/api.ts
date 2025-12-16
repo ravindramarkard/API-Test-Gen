@@ -26,6 +26,10 @@ api.interceptors.request.use(
       // Remove leading slash to ensure baseURL is used
       config.url = config.url.substring(1);
     }
+    // Add trailing slash for GET requests to avoid redirects
+    if (config.method === 'get' && config.url && !config.url.endsWith('/') && !config.url.includes('?')) {
+      config.url = config.url + '/';
+    }
     // Debug: Log the actual URL being used
     console.log('Request URL:', config.url);
     console.log('Base URL:', config.baseURL);

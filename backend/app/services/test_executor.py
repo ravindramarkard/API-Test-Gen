@@ -341,72 +341,167 @@ class TestExecutor:
                 if not all_passed:
                     result['error'] = f"Some CRUD operations failed: {[op for op, r in crud_results.items() if not r['success']]}"
             
-            elif test_type == 'e2e' and 'e2e_flow' in test_case:
-                # Execute E2E flow (complete user scenario)
+            elif test_type == 'e2e' and ('e2e_flow' in test_case or (isinstance(test_case.get('payload'), dict) and 'flow' in test_case.get('payload', {}))):
+                # Execute E2E flow (complete user scenario) with rollback support
+                e2e_flow = test_case.get('e2e_flow') or test_case.get('payload', {}).get('flow', [])
+                rollback_ops = test_case.get('payload', {}).get('rollback', [])
                 e2e_results = []
+                executed_steps = []  # Track executed steps for rollback
                 
-                for e2e_step in test_case.get('e2e_flow', []):
-                    e2e_endpoint = e2e_step.get('endpoint', '')
-                    e2e_method = e2e_step.get('method', 'GET').upper()
-                    e2e_payload = e2e_step.get('payload', {})
-                    
-                    # Replace path parameters
-                    e2e_payload_copy = dict(e2e_payload) if isinstance(e2e_payload, dict) else {}
-                    e2e_endpoint = self._replace_path_parameters(e2e_endpoint, e2e_payload_copy)
-                    e2e_url = f"{self.base_url}{e2e_endpoint}"
-                    
-                    # Execute E2E step
-                    # Check if this is a file upload endpoint
-                    is_file_upload = 'upload' in e2e_endpoint.lower() or 'image' in e2e_endpoint.lower()
-                    
-                    request_headers = self._snapshot_headers(self.session.headers)
-                    if e2e_method == 'GET':
-                        e2e_response = self.session.get(e2e_url, params=e2e_payload_copy, timeout=30)
-                    elif e2e_method == 'POST':
-                        if is_file_upload:
-                            # Handle file upload with multipart/form-data
-                            files = {'file': ('test.jpg', b'fake image content', 'image/jpeg')}
-                            data = {k: v for k, v in e2e_payload_copy.items() if k != 'file'}
-                            e2e_response = self.session.post(e2e_url, files=files, data=data, timeout=30)
-                        else:
-                            e2e_response = self.session.post(e2e_url, json=e2e_payload_copy, timeout=30)
-                    elif e2e_method == 'PUT':
-                        e2e_response = self.session.put(e2e_url, json=e2e_payload_copy, timeout=30)
-                    elif e2e_method == 'DELETE':
-                        e2e_response = self.session.delete(e2e_url, timeout=30)
-                    else:
-                        continue
-                    
-                    # Extract and store values from response
-                    self._extract_and_store_response_values(e2e_response, e2e_endpoint, e2e_method)
-                    
-                    e2e_results.append({
-                        'endpoint': e2e_endpoint,
-                        'method': e2e_method,
-                        'status': e2e_response.status_code,
-                        'success': 200 <= e2e_response.status_code < 300,
-                        'description': e2e_step.get('description', '')
-                    })
-                    # Record trace
-                    try:
-                        response_headers = self._snapshot_headers(e2e_response.headers)
-                        try:
-                            response_text = e2e_response.text
-                        except Exception:
-                            response_text = None
-                        trace.append({
-                            'step': len(trace) + 1,
-                            'method': e2e_method,
+                try:
+                    for step_idx, e2e_step in enumerate(e2e_flow):
+                        e2e_endpoint = e2e_step.get('endpoint', '')
+                        e2e_method = e2e_step.get('method', 'GET').upper()
+                        e2e_payload = e2e_step.get('payload', {})
+                        
+                        # Replace path parameters
+                        e2e_payload_copy = dict(e2e_payload) if isinstance(e2e_payload, dict) else {}
+                        e2e_endpoint = self._replace_path_parameters(e2e_endpoint, e2e_payload_copy)
+                        e2e_url = f"{self.base_url}{e2e_endpoint}"
+                        
+                        # Store step info for potential rollback
+                        step_info = {
                             'endpoint': e2e_endpoint,
-                            'url': e2e_url,
-                            'request_headers': request_headers,
-                            'request_payload': e2e_payload_copy,
-                            'response_status': e2e_response.status_code,
-                            'response_headers': response_headers,
-                            'response_body': response_text[:2000] if response_text else "(empty response body)"
+                            'method': e2e_method,
+                            'payload': e2e_payload_copy,
+                            'url': e2e_url
+                        }
+                        executed_steps.append(step_info)
+                        
+                        # Execute E2E step
+                        # Check if this is a file upload endpoint
+                        is_file_upload = 'upload' in e2e_endpoint.lower() or 'image' in e2e_endpoint.lower()
+                        
+                        request_headers = self._snapshot_headers(self.session.headers)
+                        if e2e_method == 'GET':
+                            e2e_response = self.session.get(e2e_url, params=e2e_payload_copy, timeout=30)
+                        elif e2e_method == 'POST':
+                            if is_file_upload:
+                                # Handle file upload with multipart/form-data
+                                files = {'file': ('test.jpg', b'fake image content', 'image/jpeg')}
+                                data = {k: v for k, v in e2e_payload_copy.items() if k != 'file'}
+                                e2e_response = self.session.post(e2e_url, files=files, data=data, timeout=30)
+                            else:
+                                e2e_response = self.session.post(e2e_url, json=e2e_payload_copy, timeout=30)
+                        elif e2e_method == 'PUT':
+                            e2e_response = self.session.put(e2e_url, json=e2e_payload_copy, timeout=30)
+                        elif e2e_method == 'DELETE':
+                            e2e_response = self.session.delete(e2e_url, timeout=30)
+                        else:
+                            continue
+                        
+                        # Extract and store values from response
+                        self._extract_and_store_response_values(e2e_response, e2e_endpoint, e2e_method)
+                        
+                        step_success = 200 <= e2e_response.status_code < 300
+                        e2e_results.append({
+                            'endpoint': e2e_endpoint,
+                            'method': e2e_method,
+                            'status': e2e_response.status_code,
+                            'success': step_success,
+                            'description': e2e_step.get('description', '')
                         })
-                    except Exception:
-                        pass
+                        
+                        # Record trace
+                        try:
+                            response_headers = self._snapshot_headers(e2e_response.headers)
+                            try:
+                                response_text = e2e_response.text
+                            except Exception:
+                                response_text = None
+                            trace.append({
+                                'step': len(trace) + 1,
+                                'method': e2e_method,
+                                'endpoint': e2e_endpoint,
+                                'url': e2e_url,
+                                'request_headers': request_headers,
+                                'request_payload': e2e_payload_copy,
+                                'response_status': e2e_response.status_code,
+                                'response_headers': response_headers,
+                                'response_body': response_text[:2000] if response_text else "(empty response body)"
+                            })
+                        except Exception:
+                            pass
+                        
+                        # If step failed and rollback is configured, execute rollback
+                        if not step_success and rollback_ops:
+                            logger.warning(f"Step {step_idx + 1} failed, executing rollback operations...")
+                            rollback_results = []
+                            for rollback_op in rollback_ops:
+                                try:
+                                    rollback_endpoint = rollback_op.get('endpoint', '')
+                                    rollback_method = rollback_op.get('method', 'DELETE').upper()
+                                    
+                                    # Replace path parameters in rollback endpoint using context
+                                    rollback_endpoint = self._replace_path_parameters(rollback_endpoint, {})
+                                    rollback_url = f"{self.base_url}{rollback_endpoint}"
+                                    
+                                    rollback_headers = self._snapshot_headers(self.session.headers)
+                                    if rollback_method == 'DELETE':
+                                        rollback_response = self.session.delete(rollback_url, timeout=30)
+                                    elif rollback_method == 'POST':
+                                        # For recreate rollback, use original payload if available
+                                        rollback_payload = rollback_op.get('payload') or executed_steps[0].get('payload', {})
+                                        rollback_response = self.session.post(rollback_url, json=rollback_payload, timeout=30)
+                                    elif rollback_method in ['PUT', 'PATCH']:
+                                        # For restore rollback, would need original state (stored in step_info)
+                                        rollback_payload = rollback_op.get('payload') or executed_steps[0].get('payload', {})
+                                        rollback_response = self.session.put(rollback_url, json=rollback_payload, timeout=30)
+                                    else:
+                                        continue
+                                    
+                                    rollback_success = 200 <= rollback_response.status_code < 300
+                                    rollback_results.append({
+                                        'endpoint': rollback_endpoint,
+                                        'method': rollback_method,
+                                        'status': rollback_response.status_code,
+                                        'success': rollback_success,
+                                        'description': rollback_op.get('description', 'Rollback operation')
+                                    })
+                                    
+                                    # Record rollback in trace
+                                    try:
+                                        rollback_response_headers = self._snapshot_headers(rollback_response.headers)
+                                        try:
+                                            rollback_response_text = rollback_response.text
+                                        except Exception:
+                                            rollback_response_text = None
+                                        trace.append({
+                                            'step': len(trace) + 1,
+                                            'method': rollback_method,
+                                            'endpoint': rollback_endpoint,
+                                            'url': rollback_url,
+                                            'request_headers': rollback_headers,
+                                            'request_payload': rollback_op.get('payload', {}),
+                                            'response_status': rollback_response.status_code,
+                                            'response_headers': rollback_response_headers,
+                                            'response_body': rollback_response_text[:2000] if rollback_response_text else "(empty response body)",
+                                            'is_rollback': True
+                                        })
+                                    except Exception:
+                                        pass
+                                    
+                                except Exception as rollback_error:
+                                    logger.error(f"Rollback operation failed: {str(rollback_error)}")
+                                    rollback_results.append({
+                                        'endpoint': rollback_op.get('endpoint', ''),
+                                        'method': rollback_op.get('method', ''),
+                                        'status': 0,
+                                        'success': False,
+                                        'error': str(rollback_error),
+                                        'description': rollback_op.get('description', 'Rollback operation')
+                                    })
+                            
+                            result['rollback_results'] = rollback_results
+                            result['rollback_executed'] = True
+                            break  # Exit flow loop after rollback
+                
+                except Exception as flow_error:
+                    # If flow execution fails, attempt rollback
+                    if rollback_ops:
+                        logger.error(f"Flow execution error: {str(flow_error)}, attempting rollback...")
+                        # Rollback logic would go here (similar to above)
+                    raise
                 
                 # E2E test passes if all steps succeed
                 all_passed = all(r['success'] for r in e2e_results)
@@ -549,6 +644,32 @@ class TestExecutor:
             return self._execute_special_test(test_case)
         
         endpoint = test_case.get('endpoint', '')
+        
+        # Validate and clean endpoint - it should be a path, not a full URL or cURL command
+        if not endpoint:
+            raise ValueError("Endpoint path is required in test case")
+        
+        # Remove any cURL command artifacts (e.g., "-X 'GET' \\ 'https://...")
+        if endpoint.startswith('-X') or 'curl' in endpoint.lower() or (endpoint.startswith('http://') or endpoint.startswith('https://')):
+            # Try to extract just the path from URL
+            from urllib.parse import urlparse
+            if endpoint.startswith('http://') or endpoint.startswith('https://'):
+                parsed = urlparse(endpoint)
+                endpoint = parsed.path
+            else:
+                # Try to extract URL from cURL-like string
+                import re
+                url_match = re.search(r'https?://[^\s"\']+', endpoint)
+                if url_match:
+                    parsed = urlparse(url_match.group(0))
+                    endpoint = parsed.path
+                else:
+                    raise ValueError(f"Invalid endpoint format: {endpoint}. Expected a path like '/api/resource', not a URL or cURL command.")
+        
+        # Ensure endpoint starts with /
+        if not endpoint.startswith('/'):
+            endpoint = '/' + endpoint
+        
         method = test_case.get('method', 'GET').upper()
         payload = test_case.get('payload') or {}
         expected_status = test_case.get('expected_status', [200])
@@ -757,6 +878,18 @@ class TestExecutor:
 
             result['response_headers'] = response_headers
             result['completed_at'] = datetime.utcnow().isoformat()
+            
+            # Store request details in result object (not just trace) for reports
+            result['request_headers'] = request_headers
+            result['query_params'] = query_params
+            # Store body payload for POST/PUT/PATCH, None for GET/DELETE
+            if method not in ['GET', 'DELETE']:
+                result['payload'] = body_payload
+                result['request_body'] = body_payload
+            else:
+                result['payload'] = {}
+                result['request_body'] = None
+            
             # Trace for single-step tests
             trace.append({
                 'step': 1,

@@ -23,8 +23,12 @@ import {
   TableContainer,
   TableHead,
   TableRow,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
 } from '@mui/material';
-import { Settings, PlayArrow, Visibility, Search, SelectAll, Deselect } from '@mui/icons-material';
+import { Settings, PlayArrow, Visibility, Search, SelectAll, Deselect, Add } from '@mui/icons-material';
 import { useAppDispatch, useAppSelector } from '../hooks/redux';
 import { fetchProject } from '../store/slices/projectsSlice';
 import { generateTests, executeTests, fetchLatestTestSuite } from '../store/slices/testSlice';
@@ -41,6 +45,14 @@ const ProjectDetail: React.FC = () => {
   const [selectedEndpoints, setSelectedEndpoints] = useState<Set<string>>(new Set());
   const [generatedEndpoints, setGeneratedEndpoints] = useState<Set<string>>(new Set());
   const [allTestCases, setAllTestCases] = useState<any[]>([]);
+  const [activity, setActivity] = useState<any[]>([]);
+  const [activityLoading, setActivityLoading] = useState(false);
+  const [addEndpointDialogOpen, setAddEndpointDialogOpen] = useState(false);
+  const [addEndpointMode, setAddEndpointMode] = useState<'url' | 'raw' | 'curl'>('url');
+  const [endpointUrl, setEndpointUrl] = useState('');
+  const [endpointRawText, setEndpointRawText] = useState('');
+  const [endpointCurlCommand, setEndpointCurlCommand] = useState('');
+  const [addingEndpoint, setAddingEndpoint] = useState(false);
 
   useEffect(() => {
     if (projectId) {
@@ -192,7 +204,24 @@ const ProjectDetail: React.FC = () => {
       navigate(`/test-suites/${testSuite.test_suite_id}`);
       return;
     }
+    // Lazy-load activity when Activity tab is opened
+    if (newValue === 3 && projectId) {
+      loadActivity(projectId);
+    }
     setTabValue(newValue);
+  };
+
+  const loadActivity = async (projId: string) => {
+    try {
+      setActivityLoading(true);
+      const res = await api.get(`/activity/project/${projId}`);
+      setActivity(res.data.activity || []);
+    } catch (err) {
+      console.error('Failed to load activity', err);
+      setActivity([]);
+    } finally {
+      setActivityLoading(false);
+    }
   };
 
   return (
@@ -231,6 +260,7 @@ const ProjectDetail: React.FC = () => {
         <Tab label="Endpoints" />
         <Tab label="Test Suite" />
         <Tab label="Reports" />
+        <Tab label="Activity" />
       </Tabs>
 
       {tabValue === 0 && (
@@ -252,6 +282,14 @@ const ProjectDetail: React.FC = () => {
               sx={{ flex: 1, maxWidth: 500 }}
             />
             <Box display="flex" gap={1} ml={2}>
+              <Button
+                size="small"
+                variant="outlined"
+                startIcon={<Add />}
+                onClick={() => setAddEndpointDialogOpen(true)}
+              >
+                Add Endpoint
+              </Button>
               <Button
                 size="small"
                 startIcon={<SelectAll />}
@@ -529,6 +567,203 @@ const ProjectDetail: React.FC = () => {
           </Alert>
         </Box>
       )}
+
+      {tabValue === 3 && (
+        <Box>
+          <Typography variant="h6" gutterBottom>
+            Project Activity
+          </Typography>
+          {activityLoading ? (
+            <Box display="flex" justifyContent="center" p={4}>
+              <CircularProgress />
+            </Box>
+          ) : activity.length === 0 ? (
+            <Alert severity="info">
+              No activity recorded yet for this project.
+            </Alert>
+          ) : (
+            <TableContainer component={Paper} sx={{ maxHeight: '60vh', overflow: 'auto' }}>
+              <Table size="small" stickyHeader>
+                <TableHead>
+                  <TableRow>
+                    <TableCell>When</TableCell>
+                    <TableCell>Actor</TableCell>
+                    <TableCell>Action</TableCell>
+                    <TableCell>Details</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {activity.map((entry) => (
+                    <TableRow key={entry.id}>
+                      <TableCell>
+                        <Typography variant="body2">
+                          {entry.created_at
+                            ? new Date(entry.created_at).toLocaleString()
+                            : 'Unknown'}
+                        </Typography>
+                      </TableCell>
+                      <TableCell>
+                        <Typography variant="body2">
+                          {entry.actor || 'system'}
+                        </Typography>
+                      </TableCell>
+                      <TableCell>
+                        <Typography variant="body2">
+                          {entry.action}
+                        </Typography>
+                      </TableCell>
+                      <TableCell>
+                        <Typography
+                          variant="body2"
+                          color="textSecondary"
+                          sx={{ maxWidth: 400 }}
+                        >
+                          {JSON.stringify(entry.details || {}, null, 2)}
+                        </Typography>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </TableContainer>
+          )}
+        </Box>
+      )}
+
+      {/* Add Endpoint Dialog */}
+      <Dialog 
+        open={addEndpointDialogOpen} 
+        onClose={() => {
+          setAddEndpointDialogOpen(false);
+          setEndpointUrl('');
+          setEndpointRawText('');
+          setEndpointCurlCommand('');
+          setAddEndpointMode('url');
+        }}
+        maxWidth="md"
+        fullWidth
+      >
+        <DialogTitle>Add API Endpoint Manually</DialogTitle>
+        <DialogContent>
+          <Box sx={{ mt: 2 }}>
+            <Tabs 
+              value={addEndpointMode} 
+              onChange={(_, newValue) => setAddEndpointMode(newValue)}
+              sx={{ mb: 3 }}
+            >
+              <Tab label="From URL" value="url" />
+              <Tab label="Raw Text (JSON/YAML)" value="raw" />
+              <Tab label="cURL Command" value="curl" />
+            </Tabs>
+
+            {addEndpointMode === 'url' && (
+              <TextField
+                fullWidth
+                label="OpenAPI Spec URL"
+                placeholder="https://api.example.com/openapi.json"
+                value={endpointUrl}
+                onChange={(e) => setEndpointUrl(e.target.value)}
+                helperText="Enter a URL that returns an OpenAPI/Swagger specification (JSON or YAML)"
+                sx={{ mb: 2 }}
+              />
+            )}
+
+            {addEndpointMode === 'raw' && (
+              <TextField
+                fullWidth
+                multiline
+                rows={12}
+                label="OpenAPI Spec (JSON or YAML)"
+                placeholder='{"openapi": "3.0.0", "info": {...}, "paths": {...}}'
+                value={endpointRawText}
+                onChange={(e) => setEndpointRawText(e.target.value)}
+                helperText="Paste your OpenAPI specification in JSON or YAML format. Only paths will be merged into the existing project."
+                sx={{ mb: 2 }}
+              />
+            )}
+
+            {addEndpointMode === 'curl' && (
+              <TextField
+                fullWidth
+                multiline
+                rows={8}
+                label="cURL Command"
+                placeholder='curl -X GET "https://api.example.com/users" -H "accept: application/json"'
+                value={endpointCurlCommand}
+                onChange={(e) => setEndpointCurlCommand(e.target.value)}
+                helperText="Paste a cURL command. The endpoint will be extracted and added to your project."
+                sx={{ mb: 2 }}
+              />
+            )}
+          </Box>
+        </DialogContent>
+        <DialogActions>
+          <Button 
+            onClick={() => {
+              setAddEndpointDialogOpen(false);
+              setEndpointUrl('');
+              setEndpointRawText('');
+              setEndpointCurlCommand('');
+              setAddEndpointMode('url');
+            }}
+          >
+            Cancel
+          </Button>
+          <Button
+            variant="contained"
+            onClick={async () => {
+              if (!projectId) return;
+              
+              if (addEndpointMode === 'url' && !endpointUrl.trim()) {
+                alert('Please enter a URL');
+                return;
+              }
+              
+              if (addEndpointMode === 'raw' && !endpointRawText.trim()) {
+                alert('Please enter OpenAPI specification text');
+                return;
+              }
+
+              if (addEndpointMode === 'curl' && !endpointCurlCommand.trim()) {
+                alert('Please enter a cURL command');
+                return;
+              }
+
+              setAddingEndpoint(true);
+              try {
+                const payload = addEndpointMode === 'url' 
+                  ? { url: endpointUrl.trim() }
+                  : addEndpointMode === 'raw'
+                  ? { raw_text: endpointRawText.trim() }
+                  : { curl_command: endpointCurlCommand.trim() };
+                
+                const response = await api.post(`/projects/${projectId}/add-endpoints`, payload);
+                
+                alert(`✅ Successfully added ${response.data.added_endpoints?.length || 0} endpoint(s)!\n\n${response.data.message || ''}`);
+                
+                // Refresh project to show new endpoints
+                dispatch(fetchProject(projectId));
+                
+                // Close dialog and reset
+                setAddEndpointDialogOpen(false);
+                setEndpointUrl('');
+                setEndpointRawText('');
+                setEndpointCurlCommand('');
+                setAddEndpointMode('url');
+              } catch (error: any) {
+                const errorMsg = error.response?.data?.detail || error.response?.data?.message || error.message || 'Unknown error';
+                alert(`❌ Failed to add endpoints:\n\n${errorMsg}`);
+              } finally {
+                setAddingEndpoint(false);
+              }
+            }}
+            disabled={addingEndpoint || (addEndpointMode === 'url' && !endpointUrl.trim()) || (addEndpointMode === 'raw' && !endpointRawText.trim()) || (addEndpointMode === 'curl' && !endpointCurlCommand.trim())}
+            startIcon={addingEndpoint ? <CircularProgress size={20} /> : <Add />}
+          >
+            {addingEndpoint ? 'Adding...' : 'Add Endpoints'}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 };

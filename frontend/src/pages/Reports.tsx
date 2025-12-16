@@ -21,9 +21,14 @@ import {
   Paper,
   Chip,
   Button,
+  Accordion,
+  AccordionSummary,
+  AccordionDetails,
+  IconButton,
 } from '@mui/material';
-import { Download, Refresh } from '@mui/icons-material';
+import { Download, Refresh, ExpandMore, Clear } from '@mui/icons-material';
 import jsPDF from 'jspdf';
+import * as XLSX from 'xlsx';
 import html2canvas from 'html2canvas';
 import {
   LineChart,
@@ -85,6 +90,7 @@ interface ReportData {
     passed: number;
     failed: number;
     errors: number;
+    pass_rate?: number;
   }>;
   time_range: {
     start: string;
@@ -107,8 +113,17 @@ const Reports: React.FC = () => {
   const [projectsData, setProjectsData] = useState<any[]>([]);
   const [testSuiteName, setTestSuiteName] = useState<string>('');
   const [projectName, setProjectName] = useState<string>('');
+  const [expandedEndpoints, setExpandedEndpoints] = useState<Set<string>>(new Set());
+  const [endpointTestCases, setEndpointTestCases] = useState<Record<string, any[]>>({});
+  const [loadingTestCases, setLoadingTestCases] = useState<Set<string>>(new Set());
+  const [isCleared, setIsCleared] = useState(false);
 
   useEffect(() => {
+    // Don't auto-fetch if data was intentionally cleared
+    if (isCleared) {
+      return;
+    }
+    
     if (!projectId && !testSuiteId) {
       // Global report - fetch projects with test suites
       fetchProjectsData();
@@ -128,6 +143,7 @@ const Reports: React.FC = () => {
   const fetchReportData = async () => {
     try {
       setLoading(true);
+      setIsCleared(false);
       let url: string;
       if (reportMode === 'last-run') {
         if (testSuiteId) {
@@ -176,6 +192,58 @@ const Reports: React.FC = () => {
       }
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleToggleEndpoint = async (method: string, endpoint: string) => {
+    const endpointKey = `${method}:${endpoint}`;
+    const isExpanded = expandedEndpoints.has(endpointKey);
+    
+    if (isExpanded) {
+      // Collapse
+      const newExpanded = new Set(expandedEndpoints);
+      newExpanded.delete(endpointKey);
+      setExpandedEndpoints(newExpanded);
+    } else {
+      // Expand - fetch test cases if not already loaded
+      const newExpanded = new Set(expandedEndpoints);
+      newExpanded.add(endpointKey);
+      setExpandedEndpoints(newExpanded);
+      
+      if (!endpointTestCases[endpointKey]) {
+        const newLoading = new Set(loadingTestCases);
+        newLoading.add(endpointKey);
+        setLoadingTestCases(newLoading);
+        
+        try {
+          let url = `/reports/endpoint/${method}${endpoint}/test-cases?`;
+          if (testSuiteId) {
+            url += `test_suite_id=${testSuiteId}&`;
+          } else if (projectId) {
+            url += `project_id=${projectId}&`;
+          }
+          if (reportMode === 'last-run' && reportData && 'execution_id' in reportData) {
+            url += `execution_id=${reportData.execution_id}&`;
+          }
+          url += `days=${days}`;
+          
+          const response = await api.get(url);
+          setEndpointTestCases({
+            ...endpointTestCases,
+            [endpointKey]: response.data.test_cases || []
+          });
+        } catch (error: any) {
+          console.error('Failed to fetch endpoint test cases:', error);
+          setEndpointTestCases({
+            ...endpointTestCases,
+            [endpointKey]: []
+          });
+        } finally {
+          const newLoading = new Set(loadingTestCases);
+          newLoading.delete(endpointKey);
+          setLoadingTestCases(newLoading);
+        }
+      }
     }
   };
 
@@ -232,6 +300,197 @@ const Reports: React.FC = () => {
     } catch (error) {
       console.error('Failed to generate PDF:', error);
       alert('Failed to generate PDF. Please try again.');
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  const handleDownloadExcel = async () => {
+    if (!reportData) {
+      alert('No report data available');
+      return;
+    }
+
+    try {
+      setDownloading(true);
+      
+      // Fetch all test cases from all endpoints
+      const allTestCases: any[] = [];
+      const { endpoint_performance } = reportData;
+      
+      if (endpoint_performance && Array.isArray(endpoint_performance)) {
+        for (const endpoint of endpoint_performance) {
+          try {
+            let url = `/reports/endpoint/${endpoint.method}${endpoint.endpoint}/test-cases?`;
+            if (testSuiteId) {
+              url += `test_suite_id=${testSuiteId}&`;
+            } else if (projectId) {
+              url += `project_id=${projectId}&`;
+            }
+            if (reportMode === 'last-run' && reportData && 'execution_id' in reportData) {
+              url += `execution_id=${reportData.execution_id}&`;
+            }
+            url += `days=${days}`;
+            
+            const response = await api.get(url);
+            const testCases = response.data.test_cases || [];
+            allTestCases.push(...testCases);
+          } catch (error: any) {
+            console.error(`Failed to fetch test cases for ${endpoint.method} ${endpoint.endpoint}:`, error);
+          }
+        }
+      }
+
+      // Create workbook
+      const wb = XLSX.utils.book_new();
+
+      // 1. Summary Sheet
+      const summaryData = [
+        ['Test Execution Report'],
+        [],
+        ['Report Information'],
+        ['Report Type', reportMode === 'last-run' ? 'Last Run' : `Last ${days} Days`],
+        ['Generated At', new Date().toLocaleString()],
+        [],
+        ['Summary Metrics'],
+        ['Total Executions', reportData.summary?.total_executions || 0],
+        ['Total Tests', reportData.summary?.total_tests || 0],
+        ['Passed', reportData.summary?.total_passed || 0],
+        ['Failed', reportData.summary?.total_failed || 0],
+        ['Errors', reportData.summary?.total_errors || 0],
+        ['Pass Rate', `${(reportData.summary?.pass_rate || 0).toFixed(2)}%`],
+        [],
+        ['Test Type Breakdown'],
+        ...Object.entries(reportData.test_type_breakdown || {}).map(([type, count]) => [type, count]),
+        [],
+        ['Status Breakdown'],
+        ['Passed', reportData.status_breakdown?.passed || 0],
+        ['Failed', reportData.status_breakdown?.failed || 0],
+        ['Errors', reportData.status_breakdown?.errors || 0],
+      ];
+
+      const summaryWs = XLSX.utils.aoa_to_sheet(summaryData);
+      XLSX.utils.book_append_sheet(wb, summaryWs, 'Summary');
+
+      // 2. Test Cases Sheet
+      const testCasesData = [
+        [
+          'Test Name',
+          'Test Type',
+          'Status',
+          'Method',
+          'Endpoint',
+          'Request URL',
+          'Request Headers',
+          'Request Payload',
+          'Request Query Params',
+          'Response Status Code',
+          'Response Headers',
+          'Response Body',
+          'Expected Status',
+          'Error',
+          'Execution Date',
+        ],
+      ];
+
+      allTestCases.forEach((testCase: any) => {
+        testCasesData.push([
+          testCase.test_name || 'N/A',
+          testCase.test_type || 'N/A',
+          testCase.status || 'N/A',
+          testCase.method || testCase.request?.method || 'N/A',
+          testCase.endpoint || 'N/A',
+          testCase.request?.url || 'N/A',
+          testCase.request?.headers ? JSON.stringify(testCase.request.headers, null, 2) : '',
+          testCase.request?.payload ? JSON.stringify(testCase.request.payload, null, 2) : '',
+          testCase.request?.query_params ? JSON.stringify(testCase.request.query_params, null, 2) : '',
+          testCase.response?.status_code || 'N/A',
+          testCase.response?.headers ? JSON.stringify(testCase.response.headers, null, 2) : '',
+          testCase.response?.body ? (typeof testCase.response.body === 'string' 
+            ? testCase.response.body 
+            : JSON.stringify(testCase.response.body, null, 2)) : '',
+          Array.isArray(testCase.expected?.status) 
+            ? testCase.expected.status.join(', ')
+            : testCase.expected?.status || 'N/A',
+          testCase.error || '',
+          testCase.executed_at ? new Date(testCase.executed_at).toLocaleString() : 'N/A',
+        ]);
+      });
+
+      const testCasesWs = XLSX.utils.aoa_to_sheet(testCasesData);
+      
+      // Set column widths
+      const colWidths = [
+        { wch: 30 }, // Test Name
+        { wch: 15 }, // Test Type
+        { wch: 10 }, // Status
+        { wch: 10 }, // Method
+        { wch: 40 }, // Endpoint
+        { wch: 50 }, // Request URL
+        { wch: 30 }, // Request Headers
+        { wch: 50 }, // Request Payload
+        { wch: 30 }, // Request Query Params
+        { wch: 15 }, // Response Status Code
+        { wch: 30 }, // Response Headers
+        { wch: 50 }, // Response Body
+        { wch: 15 }, // Expected Status
+        { wch: 30 }, // Error
+        { wch: 20 }, // Execution Date
+      ];
+      testCasesWs['!cols'] = colWidths;
+      
+      XLSX.utils.book_append_sheet(wb, testCasesWs, 'Test Cases');
+
+      // 3. Endpoint Performance Sheet
+      if (endpoint_performance && Array.isArray(endpoint_performance)) {
+        const endpointData = [
+          [
+            'Method',
+            'Endpoint',
+            'Total Tests',
+            'Passed',
+            'Failed',
+            'Errors',
+            'Pass Rate (%)',
+          ],
+        ];
+
+        endpoint_performance.forEach((endpoint: any) => {
+          endpointData.push([
+            endpoint.method || 'N/A',
+            endpoint.endpoint || 'N/A',
+            endpoint.total || 0,
+            endpoint.passed || 0,
+            endpoint.failed || 0,
+            endpoint.errors || 0,
+            `${(endpoint.pass_rate || 0).toFixed(2)}%`,
+          ]);
+        });
+
+        const endpointWs = XLSX.utils.aoa_to_sheet(endpointData);
+        endpointWs['!cols'] = [
+          { wch: 10 }, // Method
+          { wch: 40 }, // Endpoint
+          { wch: 12 }, // Total Tests
+          { wch: 10 }, // Passed
+          { wch: 10 }, // Failed
+          { wch: 10 }, // Errors
+          { wch: 15 }, // Pass Rate
+        ];
+        XLSX.utils.book_append_sheet(wb, endpointWs, 'Endpoint Performance');
+      }
+
+      // Generate filename
+      const timestamp = new Date().toISOString().split('T')[0];
+      const filename = reportMode === 'last-run' 
+        ? `test-report-last-run-${timestamp}.xlsx`
+        : `test-report-${days}days-${timestamp}.xlsx`;
+      
+      // Write file
+      XLSX.writeFile(wb, filename);
+    } catch (error) {
+      console.error('Failed to generate Excel:', error);
+      alert('Failed to generate Excel file. Please try again.');
     } finally {
       setDownloading(false);
     }
@@ -388,17 +647,110 @@ const Reports: React.FC = () => {
         </Box>
       );
     }
+    // Show different message if data was cleared vs failed to load
+    if (isCleared) {
+      // Permanently cleared - no reload option
+      return (
+        <Box>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={3}>
+            <Typography variant="h4" component="h1">
+              {testSuiteId
+                ? `Test Suite Report${testSuiteName ? `: ${testSuiteName}` : ''}`
+                : projectId 
+                  ? `Project Report${projectName ? `: ${projectName}` : ''}` 
+                  : 'Overall Test Reports'}
+            </Typography>
+          </Box>
+          <Alert severity="info" sx={{ mb: 2 }}>
+            <Typography variant="body1" gutterBottom>
+              <strong>Report data has been cleared.</strong>
+            </Typography>
+            <Typography variant="body2">
+              All report data has been permanently cleared. Navigate to a different page or refresh the browser to load new data.
+            </Typography>
+          </Alert>
+          {testSuiteId && (
+            <Button
+              variant="contained"
+              onClick={() => window.location.href = `/test-suites/${testSuiteId}`}
+              sx={{ mt: 2 }}
+            >
+              Go to Test Suite
+            </Button>
+          )}
+          {projectId && !testSuiteId && (
+            <Button
+              variant="contained"
+              onClick={() => window.location.href = `/projects/${projectId}`}
+              sx={{ mt: 2 }}
+            >
+              Go to Project
+            </Button>
+          )}
+        </Box>
+      );
+    }
+    // Failed to load - show retry option
     return (
       <Box>
+        <Box display="flex" justifyContent="space-between" alignItems="center" mb={3}>
+          <Typography variant="h4" component="h1">
+            {testSuiteId
+              ? `Test Suite Report${testSuiteName ? `: ${testSuiteName}` : ''}`
+              : projectId 
+                ? `Project Report${projectName ? `: ${projectName}` : ''}` 
+                : 'Overall Test Reports'}
+          </Typography>
+          <Box display="flex" gap={2}>
+            <FormControl variant="outlined" size="small" sx={{ minWidth: 140 }}>
+              <InputLabel>Report Type</InputLabel>
+              <Select
+                value={reportMode}
+                onChange={(e) => {
+                  setReportMode(e.target.value as ReportMode);
+                  if (e.target.value === 'period') {
+                    setDays(30);
+                  }
+                }}
+                label="Report Type"
+              >
+                <MenuItem value="period">Time Period</MenuItem>
+                <MenuItem value="last-run">Last Run</MenuItem>
+              </Select>
+            </FormControl>
+            {reportMode === 'period' && (
+              <FormControl variant="outlined" size="small" sx={{ minWidth: 120 }}>
+                <InputLabel>Time Period</InputLabel>
+                <Select
+                  value={days}
+                  onChange={(e) => setDays(e.target.value as number)}
+                  label="Time Period"
+                >
+                  <MenuItem value={7}>Last 7 Days</MenuItem>
+                  <MenuItem value={30}>Last 30 Days</MenuItem>
+                  <MenuItem value={90}>Last 90 Days</MenuItem>
+                  <MenuItem value={365}>Last 365 Days</MenuItem>
+                </Select>
+              </FormControl>
+            )}
+            <Button
+              variant="outlined"
+              startIcon={<Refresh />}
+              onClick={fetchReportData}
+              disabled={loading}
+            >
+              Refresh
+            </Button>
+          </Box>
+        </Box>
         <Alert severity="error" sx={{ mb: 2 }}>
-          Failed to load report data
+          <Typography variant="body1" gutterBottom>
+            <strong>Failed to load report data</strong>
+          </Typography>
+          <Typography variant="body2">
+            Click "Refresh" to retry loading the report.
+          </Typography>
         </Alert>
-        <Button
-          variant="outlined"
-          onClick={fetchReportData}
-        >
-          Retry
-        </Button>
       </Box>
     );
   }
@@ -615,7 +967,31 @@ const Reports: React.FC = () => {
             Refresh
           </Button>
           <Button
+            variant="outlined"
+            color="error"
+            startIcon={<Clear />}
+            onClick={() => {
+              setReportData(null);
+              setExpandedEndpoints(new Set());
+              setEndpointTestCases({});
+              setLoadingTestCases(new Set());
+              setLoading(false);
+              setIsCleared(true);
+            }}
+            disabled={loading || !reportData}
+          >
+            Clear
+          </Button>
+          <Button
             variant="contained"
+            startIcon={<Download />}
+            onClick={handleDownloadExcel}
+            disabled={downloading || !reportData}
+          >
+            {downloading ? 'Generating...' : 'Download Excel'}
+          </Button>
+          <Button
+            variant="outlined"
             startIcon={<Download />}
             onClick={handleDownloadPDF}
             disabled={downloading || !reportData}
@@ -700,18 +1076,6 @@ const Reports: React.FC = () => {
               </Typography>
               <Typography variant="h4" color={summary.pass_rate >= 80 ? 'success.main' : 'error.main'}>
                 {summary.pass_rate.toFixed(1)}%
-              </Typography>
-            </CardContent>
-          </Card>
-        </Grid>
-        <Grid item xs={12} sm={6} md={3}>
-          <Card>
-            <CardContent>
-              <Typography color="textSecondary" gutterBottom>
-                Security Findings
-              </Typography>
-              <Typography variant="h4" color="warning.main">
-                {security_findings.length}
               </Typography>
             </CardContent>
           </Card>
@@ -817,53 +1181,6 @@ const Reports: React.FC = () => {
         </CardContent>
       </Card>
 
-      {/* Security Findings */}
-      {security_findings.length > 0 && (
-        <Card sx={{ mb: 4 }}>
-          <CardContent>
-            <Typography variant="h6" gutterBottom>
-              Security Findings ({security_findings.length})
-            </Typography>
-            <TableContainer component={Paper}>
-              <Table>
-                <TableHead>
-                  <TableRow>
-                    <TableCell>Test Name</TableCell>
-                    <TableCell>Endpoint</TableCell>
-                    <TableCell>Method</TableCell>
-                    <TableCell>Issue</TableCell>
-                    <TableCell>Date</TableCell>
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {security_findings.slice(0, 20).map((finding, index) => (
-                    <TableRow key={index}>
-                      <TableCell>{finding.test_name}</TableCell>
-                      <TableCell>
-                        <Typography variant="body2" fontFamily="monospace">
-                          {finding.endpoint}
-                        </Typography>
-                      </TableCell>
-                      <TableCell>
-                        <Chip label={finding.method} size="small" />
-                      </TableCell>
-                      <TableCell>
-                        <Typography variant="body2" color="error">
-                          {finding.error}
-                        </Typography>
-                      </TableCell>
-                      <TableCell>
-                        {new Date(finding.date).toLocaleDateString()}
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </TableContainer>
-          </CardContent>
-        </Card>
-      )}
-
       {/* Endpoint Performance Table */}
       <Card>
         <CardContent>
@@ -885,43 +1202,328 @@ const Reports: React.FC = () => {
               </TableHead>
               <TableBody>
                 {endpoint_performance.slice(0, 20).map((endpoint, index) => {
-                  const passRate = endpoint.total > 0 
-                    ? (endpoint.passed / endpoint.total * 100).toFixed(1)
-                    : '0.0';
+                  const passRate = endpoint.pass_rate !== undefined 
+                    ? endpoint.pass_rate.toFixed(1)
+                    : endpoint.total > 0 
+                      ? (endpoint.passed / endpoint.total * 100).toFixed(1)
+                      : '0.0';
+                  const endpointKey = `${endpoint.method}:${endpoint.endpoint}`;
+                  const isExpanded = expandedEndpoints.has(endpointKey);
+                  const testCases = endpointTestCases[endpointKey] || [];
+                  const isLoading = loadingTestCases.has(endpointKey);
+                  
                   return (
-                    <TableRow key={index}>
-                      <TableCell>
-                        <Chip 
-                          label={endpoint.method} 
-                          size="small"
-                          color={endpoint.method === 'GET' ? 'success' : 'primary'}
-                        />
-                      </TableCell>
-                      <TableCell>
-                        <Typography variant="body2" fontFamily="monospace">
-                          {endpoint.endpoint}
-                        </Typography>
-                      </TableCell>
-                      <TableCell>{endpoint.total}</TableCell>
-                      <TableCell>
-                        <Chip label={endpoint.passed} size="small" color="success" />
-                      </TableCell>
-                      <TableCell>
-                        <Chip label={endpoint.failed} size="small" color="error" />
-                      </TableCell>
-                      <TableCell>
-                        <Chip label={endpoint.errors} size="small" color="warning" />
-                      </TableCell>
-                      <TableCell>
-                        <Typography 
-                          variant="body2" 
-                          color={parseFloat(passRate) >= 80 ? 'success.main' : 'error.main'}
-                          fontWeight="bold"
-                        >
-                          {passRate}%
-                        </Typography>
-                      </TableCell>
-                    </TableRow>
+                    <React.Fragment key={index}>
+                      <TableRow 
+                        hover
+                        sx={{ cursor: 'pointer' }}
+                      >
+                        <TableCell>
+                          <Box display="flex" alignItems="center" gap={1}>
+                            <IconButton
+                              size="small"
+                              onClick={() => handleToggleEndpoint(endpoint.method, endpoint.endpoint)}
+                              sx={{ 
+                                transform: isExpanded ? 'rotate(180deg)' : 'rotate(0deg)',
+                                transition: 'transform 0.2s'
+                              }}
+                            >
+                              <ExpandMore />
+                            </IconButton>
+                            <Chip 
+                              label={endpoint.method} 
+                              size="small"
+                              color={endpoint.method === 'GET' ? 'success' : 'primary'}
+                            />
+                          </Box>
+                        </TableCell>
+                        <TableCell>
+                          <Typography variant="body2" fontFamily="monospace">
+                            {endpoint.endpoint}
+                          </Typography>
+                        </TableCell>
+                        <TableCell>{endpoint.total}</TableCell>
+                        <TableCell>
+                          <Chip label={endpoint.passed} size="small" color="success" />
+                        </TableCell>
+                        <TableCell>
+                          <Chip label={endpoint.failed} size="small" color="error" />
+                        </TableCell>
+                        <TableCell>
+                          <Chip label={endpoint.errors} size="small" color="warning" />
+                        </TableCell>
+                        <TableCell>
+                          <Typography 
+                            variant="body2" 
+                            color={parseFloat(passRate) >= 80 ? 'success.main' : 'error.main'}
+                            fontWeight="bold"
+                          >
+                            {passRate}%
+                          </Typography>
+                        </TableCell>
+                      </TableRow>
+                      {isExpanded && (
+                        <TableRow>
+                          <TableCell colSpan={7} sx={{ py: 0, border: 0 }}>
+                            <Box sx={{ pl: 4, pr: 2, pb: 2 }}>
+                              {isLoading ? (
+                                <Box display="flex" justifyContent="center" p={3}>
+                                  <CircularProgress />
+                                </Box>
+                              ) : testCases.length === 0 ? (
+                                <Alert severity="info">No test cases found for this endpoint.</Alert>
+                              ) : (
+                                <Box>
+                                  {/* Group test cases by type */}
+                                  {(() => {
+                                    // Group test cases by type
+                                    const groupedByType: Record<string, any[]> = {};
+                                    testCases.forEach((testCase: any) => {
+                                      const testType = testCase.test_type || 'unknown';
+                                      if (!groupedByType[testType]) {
+                                        groupedByType[testType] = [];
+                                      }
+                                      groupedByType[testType].push(testCase);
+                                    });
+                                    
+                                    // Test type order (priority)
+                                    const typeOrder = ['happy_path', 'negative', 'boundary', 'validation', 'security', 'performance', 'integration', 'e2e', 'crud'];
+                                    
+                                    return Object.keys(groupedByType)
+                                      .sort((a, b) => {
+                                        const aIndex = typeOrder.indexOf(a);
+                                        const bIndex = typeOrder.indexOf(b);
+                                        if (aIndex !== -1 && bIndex !== -1) return aIndex - bIndex;
+                                        if (aIndex !== -1) return -1;
+                                        if (bIndex !== -1) return 1;
+                                        return a.localeCompare(b);
+                                      })
+                                      .map((testType) => {
+                                        const typeTestCases = groupedByType[testType];
+                                        const typePassed = typeTestCases.filter((tc: any) => tc.status === 'passed').length;
+                                        const typeFailed = typeTestCases.filter((tc: any) => tc.status === 'failed').length;
+                                        const typeErrors = typeTestCases.filter((tc: any) => tc.status === 'error').length;
+                                        
+                                        return (
+                                          <Accordion key={testType} defaultExpanded={typeFailed > 0} sx={{ mb: 2 }}>
+                                            <AccordionSummary expandIcon={<ExpandMore />}>
+                                              <Box display="flex" alignItems="center" gap={2} width="100%">
+                                                <Typography variant="subtitle1" fontWeight="bold">
+                                                  {testType.replace('_', ' ').toUpperCase()}
+                                                </Typography>
+                                                <Chip label={`Total: ${typeTestCases.length}`} size="small" />
+                                                <Chip label={`Passed: ${typePassed}`} size="small" color="success" />
+                                                <Chip label={`Failed: ${typeFailed}`} size="small" color="error" />
+                                                {typeErrors > 0 && (
+                                                  <Chip label={`Errors: ${typeErrors}`} size="small" color="warning" />
+                                                )}
+                                              </Box>
+                                            </AccordionSummary>
+                                            <AccordionDetails>
+                                              {typeTestCases.map((testCase: any, testIndex: number) => (
+                                                <Accordion key={testIndex} defaultExpanded={testCase.status === 'failed'} sx={{ mb: 1 }}>
+                                                  <AccordionSummary expandIcon={<ExpandMore />}>
+                                                    <Box display="flex" alignItems="center" gap={2} width="100%">
+                                                      <Chip
+                                                        label={testCase.status}
+                                                        size="small"
+                                                        color={testCase.status === 'passed' ? 'success' : testCase.status === 'failed' ? 'error' : 'warning'}
+                                                      />
+                                                      <Typography variant="body2" fontWeight="medium">
+                                                        {testCase.test_name}
+                                                      </Typography>
+                                                    </Box>
+                                                  </AccordionSummary>
+                                      <AccordionDetails>
+                                        <Grid container spacing={2}>
+                                          {/* Request */}
+                                          <Grid item xs={12} md={6}>
+                                            <Typography variant="subtitle2" gutterBottom>
+                                              Request
+                                            </Typography>
+                                            <Card variant="outlined">
+                                              <CardContent>
+                                                <Typography variant="body2" gutterBottom>
+                                                  <strong>Method:</strong> {testCase.request?.method || testCase.method}
+                                                </Typography>
+                                                <Typography variant="body2" gutterBottom>
+                                                  <strong>URL:</strong> {testCase.request?.url || testCase.endpoint}
+                                                </Typography>
+                                                {testCase.request?.headers && Object.keys(testCase.request.headers).length > 0 && (
+                                                  <Box mt={1}>
+                                                    <Typography variant="body2" fontWeight="bold">Headers:</Typography>
+                                                    <pre style={{ fontSize: '0.75rem', overflow: 'auto', maxHeight: '150px' }}>
+                                                      {JSON.stringify(testCase.request.headers, null, 2)}
+                                                    </pre>
+                                                  </Box>
+                                                )}
+                                                {testCase.request?.payload && Object.keys(testCase.request.payload).length > 0 && (
+                                                  <Box mt={1}>
+                                                    <Typography variant="body2" fontWeight="bold">Payload:</Typography>
+                                                    <pre style={{ fontSize: '0.75rem', overflow: 'auto', maxHeight: '200px' }}>
+                                                      {JSON.stringify(testCase.request.payload, null, 2)}
+                                                    </pre>
+                                                  </Box>
+                                                )}
+                                                {testCase.request?.query_params && Object.keys(testCase.request.query_params).length > 0 && (
+                                                  <Box mt={1}>
+                                                    <Typography variant="body2" fontWeight="bold">Query Params:</Typography>
+                                                    <pre style={{ fontSize: '0.75rem', overflow: 'auto', maxHeight: '150px' }}>
+                                                      {JSON.stringify(testCase.request.query_params, null, 2)}
+                                                    </pre>
+                                                  </Box>
+                                                )}
+                                              </CardContent>
+                                            </Card>
+                                          </Grid>
+
+                                          {/* Response */}
+                                          <Grid item xs={12} md={6}>
+                                            <Typography variant="subtitle2" gutterBottom>
+                                              Response
+                                            </Typography>
+                                            <Card variant="outlined">
+                                              <CardContent>
+                                                <Typography variant="body2" gutterBottom>
+                                                  <strong>Status Code:</strong>{' '}
+                                                  <Chip
+                                                    label={testCase.response?.status_code || 'N/A'}
+                                                    size="small"
+                                                    color={testCase.response?.status_code >= 200 && testCase.response?.status_code < 300 ? 'success' : 'error'}
+                                                  />
+                                                </Typography>
+                                                {testCase.response?.headers && Object.keys(testCase.response.headers).length > 0 && (
+                                                  <Box mt={1}>
+                                                    <Typography variant="body2" fontWeight="bold">Headers:</Typography>
+                                                    <pre style={{ fontSize: '0.75rem', overflow: 'auto', maxHeight: '150px' }}>
+                                                      {JSON.stringify(testCase.response.headers, null, 2)}
+                                                    </pre>
+                                                  </Box>
+                                                )}
+                                                {testCase.response?.body && (
+                                                  <Box mt={1}>
+                                                    <Typography variant="body2" fontWeight="bold">Body:</Typography>
+                                                    <pre style={{ fontSize: '0.75rem', overflow: 'auto', maxHeight: '200px', whiteSpace: 'pre-wrap' }}>
+                                                      {typeof testCase.response.body === 'string' 
+                                                        ? testCase.response.body 
+                                                        : JSON.stringify(testCase.response.body, null, 2)}
+                                                    </pre>
+                                                  </Box>
+                                                )}
+                                              </CardContent>
+                                            </Card>
+                                          </Grid>
+
+                                          {/* Expected */}
+                                          <Grid item xs={12}>
+                                            <Typography variant="subtitle2" gutterBottom>
+                                              Expected
+                                            </Typography>
+                                            <Card variant="outlined">
+                                              <CardContent>
+                                                <Typography variant="body2" gutterBottom>
+                                                  <strong>Status:</strong> {Array.isArray(testCase.expected?.status) 
+                                                    ? testCase.expected.status.join(', ')
+                                                    : testCase.expected?.status || 'N/A'}
+                                                </Typography>
+                                                {testCase.expected?.assertions && testCase.expected.assertions.length > 0 && (
+                                                  <Box mt={1}>
+                                                    <Typography variant="body2" fontWeight="bold">Assertions:</Typography>
+                                                    <pre style={{ fontSize: '0.75rem', overflow: 'auto', maxHeight: '150px' }}>
+                                                      {JSON.stringify(testCase.expected.assertions, null, 2)}
+                                                    </pre>
+                                                  </Box>
+                                                )}
+                                              </CardContent>
+                                            </Card>
+                                          </Grid>
+
+                                          {/* Error (if failed) */}
+                                          {testCase.error && (
+                                            <Grid item xs={12}>
+                                              <Alert severity="error">
+                                                <Typography variant="body2" fontWeight="bold">Error:</Typography>
+                                                <Typography variant="body2">{testCase.error}</Typography>
+                                              </Alert>
+                                            </Grid>
+                                          )}
+
+                                                      {/* Trace (for multi-step tests) */}
+                                                      {testCase.trace && Array.isArray(testCase.trace) && testCase.trace.length > 0 && (
+                                                        <Grid item xs={12}>
+                                                          <Typography variant="subtitle2" gutterBottom>
+                                                            Execution Trace
+                                                          </Typography>
+                                                          {testCase.trace.map((step: any, stepIndex: number) => (
+                                                            <Accordion key={stepIndex}>
+                                                              <AccordionSummary expandIcon={<ExpandMore />}>
+                                                                <Typography variant="body2">
+                                                                  Step {stepIndex + 1}: {step.method} {step.endpoint || step.url}
+                                                                </Typography>
+                                                              </AccordionSummary>
+                                                              <AccordionDetails>
+                                                                <Box>
+                                                                  {step.request_headers && (
+                                                                    <Box mb={2}>
+                                                                      <Typography variant="body2" fontWeight="bold">Request Headers:</Typography>
+                                                                      <pre style={{ fontSize: '0.75rem', overflow: 'auto', maxHeight: '150px' }}>
+                                                                        {JSON.stringify(step.request_headers, null, 2)}
+                                                                      </pre>
+                                                                    </Box>
+                                                                  )}
+                                                                  {step.request_payload && (
+                                                                    <Box mb={2}>
+                                                                      <Typography variant="body2" fontWeight="bold">Request Payload:</Typography>
+                                                                      <pre style={{ fontSize: '0.75rem', overflow: 'auto', maxHeight: '150px' }}>
+                                                                        {JSON.stringify(step.request_payload, null, 2)}
+                                                                      </pre>
+                                                                    </Box>
+                                                                  )}
+                                                                  {step.response_status && (
+                                                                    <Box mb={2}>
+                                                                      <Typography variant="body2" fontWeight="bold">Response Status: {step.response_status}</Typography>
+                                                                    </Box>
+                                                                  )}
+                                                                  {step.response_headers && (
+                                                                    <Box mb={2}>
+                                                                      <Typography variant="body2" fontWeight="bold">Response Headers:</Typography>
+                                                                      <pre style={{ fontSize: '0.75rem', overflow: 'auto', maxHeight: '150px' }}>
+                                                                        {JSON.stringify(step.response_headers, null, 2)}
+                                                                      </pre>
+                                                                    </Box>
+                                                                  )}
+                                                                  {step.response_body && (
+                                                                    <Box mb={2}>
+                                                                      <Typography variant="body2" fontWeight="bold">Response Body:</Typography>
+                                                                      <pre style={{ fontSize: '0.75rem', overflow: 'auto', maxHeight: '200px', whiteSpace: 'pre-wrap' }}>
+                                                                        {typeof step.response_body === 'string' 
+                                                                          ? step.response_body 
+                                                                          : JSON.stringify(step.response_body, null, 2)}
+                                                                      </pre>
+                                                                    </Box>
+                                                                  )}
+                                                                </Box>
+                                                              </AccordionDetails>
+                                                            </Accordion>
+                                                          ))}
+                                                        </Grid>
+                                                      )}
+                                                    </Grid>
+                                                  </AccordionDetails>
+                                                </Accordion>
+                                              ))}
+                                            </AccordionDetails>
+                                          </Accordion>
+                                        );
+                                      });
+                                  })()}
+                                </Box>
+                              )}
+                            </Box>
+                          </TableCell>
+                        </TableRow>
+                      )}
+                    </React.Fragment>
                   );
                 })}
               </TableBody>

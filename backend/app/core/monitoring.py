@@ -44,3 +44,5 @@ def record_http_request(method: str, endpoint: str, status: int, duration: float
     http_request_duration.labels(method=method, endpoint=endpoint).observe(duration)
 
 
+
+

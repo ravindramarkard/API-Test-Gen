@@ -1,7 +1,7 @@
 """
 Project configuration endpoints.
 """
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Header
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from uuid import UUID
@@ -10,6 +10,7 @@ from typing import Optional
 from app.db.database import get_db
 from app.db.models import Project, ProjectConfig
 from app.core.security import encrypt_data, decrypt_data
+from app.services.activity_logger import log_activity
 
 router = APIRouter()
 
@@ -64,7 +65,8 @@ class APITestRequest(BaseModel):
 def create_config(
     project_id: UUID,
     config: ConfigCreate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    x_actor: Optional[str] = Header(None, alias="X-Actor"),
 ):
     """Create or update project configuration."""
     # Verify project exists
@@ -110,11 +112,7 @@ def create_config(
                 'grant_type': config.oauth2_grant_type or 'client_credentials'
             }))
     
-    # Encrypt LLM API key (if provided and not local)
-    llm_api_key_encrypted = None
-    if config.llm_api_key and config.llm_provider != 'local':
-        llm_api_key_encrypted = encrypt_data(config.llm_api_key)
-    
+    # Store LLM API key directly (no encryption) - user can update via config endpoint
     # Set default endpoints for providers
     if not config.llm_endpoint:
         if config.llm_provider == 'local':
@@ -129,12 +127,32 @@ def create_config(
         if auth_credentials:
             existing_config.auth_credentials = auth_credentials
         existing_config.llm_provider = config.llm_provider
-        if llm_api_key_encrypted:
-            existing_config.llm_api_key = llm_api_key_encrypted
+        # Store LLM API key directly (no encryption) if provided
+        if config.llm_api_key and config.llm_provider != 'local':
+            existing_config.llm_api_key = config.llm_api_key
         existing_config.llm_endpoint = config.llm_endpoint
         existing_config.llm_model = config.llm_model
         db.commit()
         db.refresh(existing_config)
+
+        # Log activity
+        try:
+            log_activity(
+                db=db,
+                project_id=project_id,
+                action="updated_config",
+                actor=x_actor,
+                details={
+                    "config_id": str(existing_config.id),
+                    "base_url": existing_config.base_url,
+                    "auth_type": existing_config.auth_type,
+                    "llm_provider": existing_config.llm_provider,
+                    "llm_model": existing_config.llm_model,
+                },
+            )
+        except Exception:
+            pass
+
         return {"message": "Configuration updated", "config_id": str(existing_config.id)}
     else:
         # Create new
@@ -144,14 +162,65 @@ def create_config(
             auth_type=config.auth_type,
             auth_credentials=auth_credentials,
             llm_provider=config.llm_provider,
-            llm_api_key=llm_api_key_encrypted,
+            llm_api_key=config.llm_api_key if config.llm_api_key and config.llm_provider != 'local' else None,  # Store directly (no encryption)
             llm_endpoint=config.llm_endpoint,
             llm_model=config.llm_model or "gpt-4"
         )
         db.add(new_config)
         db.commit()
         db.refresh(new_config)
+
+        # Log activity
+        try:
+            log_activity(
+                db=db,
+                project_id=project_id,
+                action="created_config",
+                actor=x_actor,
+                details={
+                    "config_id": str(new_config.id),
+                    "base_url": new_config.base_url,
+                    "auth_type": new_config.auth_type,
+                    "llm_provider": new_config.llm_provider,
+                    "llm_model": new_config.llm_model,
+                },
+            )
+        except Exception:
+            pass
+
         return {"message": "Configuration created", "config_id": str(new_config.id)}
+
+
+@router.delete("/{project_id}/llm-key")
+def clear_llm_api_key(
+    project_id: UUID,
+    db: Session = Depends(get_db),
+    x_actor: Optional[str] = Header(None, alias="X-Actor"),
+):
+    """Clear the stored LLM API key."""
+    config = db.query(ProjectConfig).filter(ProjectConfig.project_id == project_id).first()
+    if not config:
+        raise HTTPException(status_code=404, detail="Project configuration not found")
+    
+    config.llm_api_key = None
+    db.commit()
+    
+    # Log activity
+    try:
+        log_activity(
+            db=db,
+            project_id=project_id,
+            action="cleared_llm_key",
+            actor=x_actor,
+            details={
+                "config_id": str(config.id),
+                "reason": "User cleared LLM API key"
+            },
+        )
+    except Exception:
+        pass
+    
+    return {"message": "LLM API key cleared. Please update it in Project Configuration when needed."}
 
 
 @router.get("/")
@@ -195,6 +264,9 @@ def test_llm_connection(
     try:
         # Load stored config to reuse secrets if not provided
         stored_config = db.query(ProjectConfig).filter(ProjectConfig.project_id == project_id).first()
+        
+        logger.info(f"Test LLM connection request: provider={test_request.llm_provider}, has_key_in_request={bool(test_request.llm_api_key)}, has_stored_config={bool(stored_config)}")
+        
         if stored_config:
             # Reuse provider/model/endpoint if not supplied
             if not test_request.llm_provider:
@@ -203,16 +275,31 @@ def test_llm_connection(
                 test_request.llm_model = stored_config.llm_model or test_request.llm_model
             if not test_request.llm_endpoint:
                 test_request.llm_endpoint = stored_config.llm_endpoint
-            # Reuse API key if not supplied
+            # Reuse API key if not supplied (stored directly, no decryption needed)
             if not test_request.llm_api_key and stored_config.llm_api_key:
-                try:
-                    test_request.llm_api_key = decrypt_data(stored_config.llm_api_key)
-                except Exception:
-                    # If decrypt fails, force user to re-enter the key
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Stored LLM API key could not be decrypted. Please re-enter your LLM API key and try again."
-                    )
+                test_request.llm_api_key = stored_config.llm_api_key
+                logger.info("Using stored LLM API key for test connection")
+            else:
+                logger.info(f"Not using stored key: has_key_in_request={bool(test_request.llm_api_key)}, has_stored_key={bool(stored_config.llm_api_key)}")
+        
+        # Fallback to environment variable if not in database and not provided
+        if not test_request.llm_api_key and test_request.llm_provider != 'local':
+            from app.core.config import settings
+            if settings.LLM_API_KEY and settings.LLM_API_KEY.strip():
+                test_request.llm_api_key = settings.LLM_API_KEY
+                logger.info("Using LLM API key from environment variable for test connection")
+            else:
+                logger.warning("No LLM API key found in environment variable")
+        
+        # Validate that we have an API key for non-local providers
+        if not test_request.llm_api_key and test_request.llm_provider != 'local':
+            logger.error(f"LLM API key validation failed: provider={test_request.llm_provider}, has_key={bool(test_request.llm_api_key)}")
+            raise HTTPException(
+                status_code=400,
+                detail="LLM API key is required for this provider. Please configure it in Project Configuration or set LLM_API_KEY environment variable."
+            )
+        
+        logger.info(f"Final LLM test config: provider={test_request.llm_provider}, has_key={bool(test_request.llm_api_key)}, endpoint={test_request.llm_endpoint}")
 
         # Determine endpoint
         endpoint = test_request.llm_endpoint
@@ -333,8 +420,18 @@ def test_llm_connection(
             status_code=400,
             detail="Connection timeout. The LLM service may be slow or unavailable."
         )
+    except HTTPException:
+        # Re-raise HTTP exceptions (like decryption errors) as-is
+        raise
     except Exception as e:
-        logger.error(f"LLM test error: {str(e)}")
+        logger.error(f"LLM test error: {str(e)}", exc_info=True)
+        # Check if it's a decryption error that wasn't caught
+        error_str = str(e).lower()
+        if "decrypt" in error_str or "decryption" in error_str or "failed to decrypt" in error_str:
+            raise HTTPException(
+                status_code=400,
+                detail="Stored LLM API key could not be decrypted. Please re-enter your LLM API key and try again."
+            )
         raise HTTPException(
             status_code=500,
             detail=f"Test failed: {str(e)}"

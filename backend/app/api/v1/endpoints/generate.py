@@ -1,7 +1,7 @@
 """
 Test generation endpoints.
 """
-from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, Body
+from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, Body, Header
 from sqlalchemy.orm import Session
 from uuid import UUID
 from typing import Optional, List, Dict, Any
@@ -11,7 +11,7 @@ from app.db.database import get_db
 from app.db.models import Project, ProjectConfig, TestSuite
 from app.services.openapi_parser import OpenAPIParser
 from app.services.test_generator import TestGenerator
-from app.core.security import decrypt_data
+from app.services.activity_logger import log_activity
 
 router = APIRouter()
 
@@ -34,7 +34,8 @@ def generate_tests(
     project_id: UUID,
     test_format: str = "pytest",
     request_body: Optional[GenerateTestsRequest] = Body(None),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    x_actor: Optional[str] = Header(None, alias="X-Actor"),
 ):
     """
     Generate test cases for a project.
@@ -68,15 +69,22 @@ def generate_tests(
     # Require LLM config for LLM-enhanced generation (non-local providers).
     # Local provider (Ollama) does not need an API key.
     llm_provider_check = (config.llm_provider or "openai") if config else "openai"
-    if llm_provider_check != "local" and (not config or not config.llm_api_key):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"LLM configuration missing for project {project_id}. "
-                f"Please configure an LLM provider, model, and API key in the Project Configuration "
-                f"(UI: /projects/{project_id}/config or API: /api/v1/config/{project_id}) before generating tests."
-            ),
-        )
+    if llm_provider_check != "local":
+        # Check if LLM API key is configured (either in database or environment)
+        has_key_in_db = config and config.llm_api_key and config.llm_api_key.strip()
+        if not has_key_in_db:
+            # Fallback to environment variable
+            from app.core.config import settings
+            has_key_in_env = settings.LLM_API_KEY and settings.LLM_API_KEY.strip()
+            if not has_key_in_env:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"LLM API key not found. Please configure it in Project Configuration "
+                        f"(UI: /projects/{project_id}/config or API: /api/v1/config/{project_id}) "
+                        f"or set LLM_API_KEY in your .env file for provider: {llm_provider_check}"
+                    ),
+                )
     
     # Parse OpenAPI spec
     parser = OpenAPIParser(spec_dict=project.openapi_spec)
@@ -101,19 +109,23 @@ def generate_tests(
             llm_api_key = None
             logger.info("Using local LLM provider - no API key needed")
         elif config.llm_api_key:
-            try:
-                llm_api_key = decrypt_data(config.llm_api_key)
-                logger.info(f"Successfully decrypted LLM API key for provider: {llm_provider}")
-            except Exception as e:
-                # If decryption fails, stop and ask user to reconfigure
-                logger.error(f"Failed to decrypt LLM API key: {str(e)}")
+            # Read LLM API key from database (stored directly, no encryption)
+            llm_api_key = config.llm_api_key
+            logger.info(f"Using LLM API key from database for provider: {llm_provider}")
+        else:
+            # Fallback to environment variable if not in database
+            from app.core.config import settings
+            llm_api_key = settings.LLM_API_KEY
+            if not llm_api_key or not llm_api_key.strip():
                 raise HTTPException(
                     status_code=400,
                     detail=(
-                        f"Stored LLM API key for project {project_id} could not be decrypted. "
-                        f"Please re-enter and save your LLM API key in Project Configuration before generating tests."
+                        f"LLM API key not found. Please configure it in Project Configuration "
+                        f"(UI: /projects/{project_id}/config or API: /api/v1/config/{project_id}) "
+                        f"or set LLM_API_KEY in your .env file for provider: {llm_provider}"
                     ),
                 )
+            logger.info(f"Using LLM API key from environment variable for provider: {llm_provider}")
     
     generator = TestGenerator(
         parser=parser,
@@ -138,10 +150,26 @@ def generate_tests(
         enabled_test_types = [t.lower() for t in request_body.test_types]
     
     # Generate tests for selected endpoints and enabled types
-    new_test_cases = generator.generate_all_tests(
-        selected_endpoints=selected_endpoints,
-        enabled_types=enabled_test_types,
-    )
+    try:
+        new_test_cases = generator.generate_all_tests(
+            selected_endpoints=selected_endpoints,
+            enabled_types=enabled_test_types,
+        )
+    except RuntimeError as e:
+        # Catch LLM generation failures and return proper HTTP error
+        error_msg = str(e)
+        logger.error(f"Test generation failed: {error_msg}", exc_info=True)
+        raise HTTPException(
+            status_code=400,
+            detail=error_msg
+        )
+    except Exception as e:
+        # Catch any other unexpected errors
+        logger.error(f"Unexpected error during test generation: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Test generation failed: {str(e)}"
+        )
     
     # Check if test suite already exists for this project
     existing_suite = db.query(TestSuite).filter(
@@ -244,6 +272,30 @@ def generate_tests(
         db.commit()
         db.refresh(test_suite)
         test_cases = new_test_cases
+
+    # Log activity
+    try:
+        endpoint_count = 0
+        if selected_endpoints:
+            endpoint_count = len(selected_endpoints)
+        else:
+            endpoint_count = len(parser.get_endpoints())
+        log_activity(
+            db=db,
+            project_id=project_id,
+            action="generated_tests",
+            actor=x_actor,
+            details={
+                "test_suite_id": str(test_suite.id),
+                "test_count": len(test_cases),
+                "endpoint_count": endpoint_count,
+                "test_format": test_format,
+                "enabled_test_types": enabled_test_types,
+            },
+        )
+    except Exception:
+        # Activity logging should never break main flow
+        pass
     
     # Format output based on format
     if test_format == "postman":
@@ -303,7 +355,12 @@ def get_test_cases(
         "all_test_cases": all_tests_with_index,
         "project_id": project_id,
         "project_name": project_name,
-        "generated_endpoints": test_suite.generated_endpoints or []
+        "generated_endpoints": test_suite.generated_endpoints or [],
+        # CI metadata for UI badges
+        "last_ci_status": test_suite.last_ci_status,
+        "last_ci_provider": test_suite.last_ci_provider,
+        "last_ci_run_id": test_suite.last_ci_run_id,
+        "last_ci_url": test_suite.last_ci_url,
     }
 
 
@@ -335,7 +392,8 @@ def get_generated_endpoints(
 def delete_endpoint_tests(
     test_suite_id: UUID,
     endpoints: List[Dict[str, str]] = Body(None),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    x_actor: Optional[str] = Header(None, alias="X-Actor"),
 ):
     """
     Delete test cases for specific endpoints and remove them from generated_endpoints.
@@ -376,6 +434,23 @@ def delete_endpoint_tests(
     test_suite.generated_endpoints = remaining_generated_endpoints
     db.commit()
     db.refresh(test_suite)
+
+    # Log activity
+    try:
+        deleted_count = len(endpoints) if endpoints else "ALL"
+        log_activity(
+            db=db,
+            project_id=test_suite.project_id,
+            action="deleted_endpoint_tests" if endpoints else "deleted_all_tests",
+            actor=x_actor,
+            details={
+                "test_suite_id": str(test_suite.id),
+                "deleted_endpoints": endpoints or "ALL",
+                "remaining_test_count": len(remaining_test_cases),
+            },
+        )
+    except Exception:
+        pass
     
     return {
         "message": "Deleted test cases" if endpoints else "Deleted all test cases",

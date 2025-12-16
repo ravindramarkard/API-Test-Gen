@@ -170,8 +170,14 @@ def get_execution_results(execution_id: UUID, db: Session = Depends(get_db)):
     if not execution:
         raise HTTPException(status_code=404, detail="Execution not found")
     
+    # Get suite to expose project linkage for integrations
+    test_suite = db.query(TestSuite).filter(TestSuite.id == execution.test_suite_id).first()
+    project_id = str(test_suite.project_id) if test_suite and test_suite.project_id else None
+
     return {
         "execution_id": str(execution.id),
+        "test_suite_id": str(execution.test_suite_id),
+        "project_id": project_id,
         "status": execution.status,
         "summary": execution.summary,
         "results": execution.results,
@@ -204,11 +210,18 @@ async def stream_execution_results(execution_id: UUID, db: Session = Depends(get
                 # Get current results
                 current_results = execution.results or []
                 current_count = len(current_results)
+                # Resolve project id for integrations
+                suite = db_session.query(TestSuite).filter(
+                    TestSuite.id == execution.test_suite_id
+                ).first()
+                project_id = str(suite.project_id) if suite and suite.project_id else None
                 
                 # Send update if results changed
                 if current_count > last_result_count or execution.status != 'running':
                     update = {
                         "execution_id": str(execution.id),
+                        "test_suite_id": str(execution.test_suite_id),
+                        "project_id": project_id,
                         "status": execution.status,
                         "summary": execution.summary,
                         "results": current_results,
